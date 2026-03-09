@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: adcontrol-render
+    runtime: docker
+    plan: starter
+    envVars:
+      - key: RENDER_SECRET
+        generateValue: true
+      - key: PORT
+        value: 3001
+    healthCheckPath: /health
