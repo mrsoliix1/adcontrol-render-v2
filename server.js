@@ -110,6 +110,25 @@ async function downloadFile(url, destPath, taskId, label, retries = 1) {
   }
 }
 
+// Convert a still image to a video clip of specified duration
+async function imageToVideo(taskId, imagePath, outputPath, duration, outW, outH, fps) {
+  log(taskId, 'image', `Converting image to ${duration}s video: ${imagePath}`);
+  const args = [
+    '-loop', '1',
+    '-i', imagePath,
+    '-t', String(duration),
+    '-vf', `scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,fps=${fps},format=yuv420p`,
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-threads', '2',
+    // Add silent audio track so xfade audio crossfade works
+    '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo',
+    '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
+    '-shortest',
+    '-y', outputPath,
+  ];
+  await runFfmpeg(taskId, args);
+  return outputPath;
+}
+
 function getVideoDuration(filePath) {
   return new Promise((resolve, reject) => {
     ffmpeg.ffprobe(filePath, (err, metadata) => {
@@ -235,12 +254,28 @@ async function processJob(taskId, params) {
     log(taskId, 'download', `Starting download of ${sortedSegments.length} segments`);
 
     const segmentPaths = [];
+    const res0 = RESOLUTIONS[resolution] || RESOLUTIONS['1080p'];
+    const { w: preW, h: preH } = computeAspectDimensions(res0.w, res0.h, aspectRatio);
+
     for (let i = 0; i < sortedSegments.length; i++) {
       const seg = sortedSegments[i];
-      const ext = seg.videoUrl.split('.').pop()?.split('?')[0] || 'mp4';
+      const url = seg.videoUrl || seg.imageUrl;
+      if (!url) throw new Error(`segment[${i}] has no videoUrl or imageUrl`);
+
+      const isImage = seg.type === 'image' || /\.(jpg|jpeg|png|gif|webp|bmp|svg)(\?|$)/i.test(url);
+      const ext = url.split('.').pop()?.split('?')[0] || (isImage ? 'jpg' : 'mp4');
       const destPath = join(workDir, `segment_${i}.${ext}`);
-      await downloadFile(seg.videoUrl, destPath, taskId, `segment ${i}`);
-      segmentPaths.push(destPath);
+      await downloadFile(url, destPath, taskId, `segment ${i}`);
+
+      if (isImage) {
+        // Convert still image to video clip
+        const videoPath = join(workDir, `segment_${i}_img.mp4`);
+        const dur = seg.duration || 5;
+        await imageToVideo(taskId, destPath, videoPath, dur, preW, preH, fps);
+        segmentPaths.push(videoPath);
+      } else {
+        segmentPaths.push(destPath);
+      }
       updateJob(taskId, { progress: Math.round((i + 1) / sortedSegments.length * 25) });
     }
 
