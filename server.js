@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import ffmpeg from 'fluent-ffmpeg';
 import { randomUUID } from 'crypto';
-import { writeFile, mkdir, stat, access, rm } from 'fs/promises';
+import { writeFile, mkdir, stat, access, rm, rename } from 'fs/promises';
 import { createWriteStream, createReadStream } from 'fs';
 import { join } from 'path';
 import { pipeline } from 'stream/promises';
@@ -241,11 +241,139 @@ function buildAudioMixFilter(videoInputIdx, segVol, speed, voiceoverPath, musicP
   };
 }
 
+// ─── Visual Filter Builder ───────────────────────────────────────────────────
+
+function buildSegmentVisualFilters(seg, outW, outH, fps) {
+  // Build the video filter chain for a segment including crop, color, blur, fade
+  const filters = [];
+
+  // Crop (applied first, before scaling)
+  const cT = seg.cropTop || 0, cB = seg.cropBottom || 0;
+  const cL = seg.cropLeft || 0, cR = seg.cropRight || 0;
+  if (cT > 0 || cB > 0 || cL > 0 || cR > 0) {
+    // cropTop/Bottom/Left/Right are percentages 0-100
+    filters.push(`crop=iw*(${(100 - cL - cR) / 100}):ih*(${(100 - cT - cB) / 100}):iw*(${cL / 100}):ih*(${cT / 100})`);
+  }
+
+  // Speed
+  const speed = seg.speed ?? 1.0;
+  if (speed !== 1.0) {
+    filters.push(`setpts=${(1 / speed).toFixed(4)}*PTS`);
+  }
+
+  // Scale and pad to output resolution
+  filters.push(`scale=${outW}:${outH}:force_original_aspect_ratio=decrease`);
+  filters.push(`pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2`);
+  filters.push(`fps=${fps}`);
+  filters.push('format=yuv420p');
+
+  // Color adjustments via eq filter
+  const brightness = (seg.brightness || 0) / 100; // -1 to 1
+  const contrast = 1 + (seg.contrast || 0) / 100; // 0 to 2
+  const saturation = 1 + (seg.saturation || 0) / 100; // 0 to 2
+  if (brightness !== 0 || contrast !== 1 || saturation !== 1) {
+    filters.push(`eq=brightness=${brightness.toFixed(3)}:contrast=${contrast.toFixed(3)}:saturation=${saturation.toFixed(3)}`);
+  }
+
+  // Blur
+  const blur = seg.blur || 0;
+  if (blur > 0) {
+    const blurVal = Math.min(blur, 20);
+    filters.push(`boxblur=${blurVal}:${blurVal}`);
+  }
+
+  // Fade in/out
+  const fadeIn = seg.fadeInDuration || 0;
+  const fadeOut = seg.fadeOutDuration || 0;
+  const duration = seg.duration || 5;
+  if (fadeIn > 0) {
+    filters.push(`fade=t=in:st=0:d=${fadeIn}`);
+  }
+  if (fadeOut > 0) {
+    const fadeOutStart = Math.max(0, duration - fadeOut);
+    filters.push(`fade=t=out:st=${fadeOutStart.toFixed(3)}:d=${fadeOut}`);
+  }
+
+  return filters.join(',');
+}
+
+function buildSegmentAudioFilters(seg) {
+  const parts = [];
+  const speed = seg.speed ?? 1.0;
+  const volume = seg.volume ?? 1.0;
+  if (speed !== 1.0) parts.push(`atempo=${speed}`);
+  parts.push(`volume=${volume}`);
+  return parts.join(',');
+}
+
+// ─── Text Overlay Post-Processing ────────────────────────────────────────────
+
+async function applyTextOverlays(taskId, inputPath, outputPath, textOverlays, outW, outH, outputFormat) {
+  if (!textOverlays || textOverlays.length === 0) return false;
+
+  log(taskId, 'text', `Applying ${textOverlays.length} text overlay(s)`);
+
+  const drawtextFilters = textOverlays.map(t => {
+    const text = (t.text || '').replace(/'/g, "'\\\\\\''").replace(/:/g, '\\:').replace(/\n/g, '\\n');
+    const fontSize = Math.round((t.fontSize || 48) * outW / 1920);
+    const fontColor = (t.fontColor || 'white').replace('#', '0x');
+    const fontFamily = t.fontFamily || 'Arial';
+
+    // Position
+    let x = '(w-text_w)/2';
+    let y = 'h*0.85-text_h/2';
+    if (t.textPosition === 'top') y = 'h*0.15-text_h/2';
+    else if (t.textPosition === 'center') y = '(h-text_h)/2';
+
+    const startTime = t.startTime || 0;
+    const endTime = startTime + (t.duration || 5);
+
+    let filter = `drawtext=text='${text}':fontsize=${fontSize}:fontcolor=${fontColor}:fontfamily='${fontFamily}'`;
+    filter += `:x=${x}:y=${y}`;
+    filter += `:enable='between(t,${startTime.toFixed(3)},${endTime.toFixed(3)})'`;
+
+    // Bold
+    if (t.fontWeight === 'bold' || t.fontWeight === '700') {
+      filter += ':borderw=1:bordercolor=' + fontColor;
+    }
+
+    // Text background
+    if (t.textBg) {
+      const bgColor = t.textBg.replace('#', '0x');
+      filter += `:box=1:boxcolor=${bgColor}@0.7:boxborderw=10`;
+    }
+
+    // Text stroke/outline
+    if (t.textStroke && (t.textStrokeWidth || 0) > 0) {
+      const strokeColor = t.textStroke.replace('#', '0x');
+      filter += `:borderw=${t.textStrokeWidth}:bordercolor=${strokeColor}`;
+    }
+
+    return filter;
+  });
+
+  const vf = drawtextFilters.join(',');
+
+  // Re-encode video with text, copy audio as-is
+  const args = [
+    '-i', inputPath,
+    '-vf', vf,
+    '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+    '-c:a', 'copy',
+    '-movflags', '+faststart',
+    '-y', outputPath,
+  ];
+
+  await runFfmpeg(taskId, args);
+  return true;
+}
+
 // ─── Render Pipeline ──────────────────────────────────────────────────────────
 
 async function processJob(taskId, params) {
   const {
     segments,
+    textOverlays = [],
     voiceoverUrl,
     musicUrl,
     musicVolume = 0.3,
@@ -348,8 +476,21 @@ async function processJob(taskId, params) {
       );
     }
 
-    updateJob(taskId, { progress: 90 });
+    updateJob(taskId, { progress: 85 });
     log(taskId, 'render', 'FFmpeg render complete');
+
+    // ── Phase 2.5: Text Overlays ────────────────────────────────────────────
+    if (textOverlays.length > 0) {
+      const textOutputPath = join(workDir, `output_text.${ext}`);
+      const applied = await applyTextOverlays(taskId, outputPath, textOutputPath, textOverlays, outW, outH, outputFormat);
+      if (applied) {
+        // Replace output with text-overlaid version
+        await rename(textOutputPath, outputPath);
+        log(taskId, 'text', 'Text overlays applied successfully');
+      }
+    }
+
+    updateJob(taskId, { progress: 95 });
 
     // ── Phase 3: Finalize ──────────────────────────────────────────────────
     updateJob(taskId, { status: 'uploading', progress: 95 });
@@ -379,31 +520,33 @@ async function renderSingleSegment(taskId, inputPath, outputPath, segment, outW,
   const segVol = segment.volume ?? 1.0;
   const speed = segment.speed ?? 1.0;
 
-  let vf = `scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,fps=${fps}`;
-  if (speed !== 1.0) {
-    vf = `setpts=${(1 / speed).toFixed(4)}*PTS,${vf}`;
-  }
+  const vf = buildSegmentVisualFilters(segment, outW, outH, fps);
+  const af = buildSegmentAudioFilters(segment);
 
   const args = ['-i', inputPath];
+
+  // Check if input has audio
+  const inputHasAudio = await hasAudioStream(inputPath);
+  if (!inputHasAudio) {
+    args.push('-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo');
+  }
 
   if (voiceoverPath) args.push('-i', voiceoverPath);
   if (musicPath) args.push('-i', musicPath);
 
-  const audioFilter = buildAudioMixFilter(0, segVol, speed, voiceoverPath, musicPath, musicVolume, voiceoverVolume);
+  const mainAudioIdx = inputHasAudio ? 0 : 1;
+  const audioFilter = buildAudioMixFilter(mainAudioIdx, segVol, speed, voiceoverPath, musicPath, musicVolume, voiceoverVolume);
 
   if (audioFilter) {
-    // When we have a complex audio filter, we can't use -vf and -filter_complex together.
-    // So embed the video filter into the complex filter as well.
     const fullFilter = `[0:v]${vf}[vout];${audioFilter.filter}`;
     args.push('-filter_complex', fullFilter);
     args.push('-map', '[vout]');
     args.push('-map', `[${audioFilter.outputLabel}]`);
   } else {
     args.push('-vf', vf);
-    if (segVol !== 1.0 || speed !== 1.0) {
-      let af = `volume=${segVol}`;
-      if (speed !== 1.0) af = `atempo=${speed},${af}`;
-      args.push('-af', af);
+    args.push('-af', af);
+    if (!inputHasAudio) {
+      args.push('-map', '0:v', '-map', '1:a', '-shortest');
     }
   }
 
@@ -417,23 +560,15 @@ async function renderSingleSegment(taskId, inputPath, outputPath, segment, outW,
 }
 
 async function renderWithConcat(taskId, segmentPaths, segments, outputPath, outW, outH, fps, outputFormat, voiceoverPath, musicPath, musicVolume, voiceoverVolume, workDir) {
-  // Step 1: Normalize all segments to same resolution/fps/codec
+  // Step 1: Normalize all segments to same resolution/fps/codec with full visual filters
   const normalizedPaths = [];
   for (let i = 0; i < segmentPaths.length; i++) {
     const seg = segments[i];
     const normPath = join(workDir, `norm_${i}.ts`);
-    const segVol = seg.volume ?? 1.0;
-    const speed = seg.speed ?? 1.0;
 
-    let vf = `scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,fps=${fps},format=yuv420p`;
-    if (speed !== 1.0) {
-      vf = `setpts=${(1 / speed).toFixed(4)}*PTS,${vf}`;
-    }
+    const vf = buildSegmentVisualFilters(seg, outW, outH, fps);
+    const af = buildSegmentAudioFilters(seg);
 
-    let af = `volume=${segVol}`;
-    if (speed !== 1.0) af = `atempo=${speed},${af}`;
-
-    // Check if input has audio — if not, add silent audio source
     const inputHasAudio = await hasAudioStream(segmentPaths[i]);
 
     const args = ['-i', segmentPaths[i]];
@@ -516,22 +651,15 @@ async function renderWithConcat(taskId, segmentPaths, segments, outputPath, outW
 }
 
 async function renderWithXfade(taskId, segmentPaths, segDurations, segments, outputPath, outW, outH, fps, outputFormat, voiceoverPath, musicPath, musicVolume, voiceoverVolume, workDir) {
-  // Step 1: Normalize all segments to same resolution/fps/codec
+  // Step 1: Normalize all segments to same resolution/fps/codec with full visual filters
   const normalizedPaths = [];
   const normalizedDurations = [];
   for (let i = 0; i < segmentPaths.length; i++) {
     const seg = segments[i];
     const normPath = join(workDir, `xnorm_${i}.mp4`);
-    const segVol = seg.volume ?? 1.0;
-    const speed = seg.speed ?? 1.0;
 
-    let vf = `scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,fps=${fps},format=yuv420p`;
-    if (speed !== 1.0) {
-      vf = `setpts=${(1 / speed).toFixed(4)}*PTS,${vf}`;
-    }
-
-    let af = `volume=${segVol}`;
-    if (speed !== 1.0) af = `atempo=${speed},${af}`;
+    const vf = buildSegmentVisualFilters(seg, outW, outH, fps);
+    const af = buildSegmentAudioFilters(seg);
 
     // Check if input has audio — if not, add silent audio source
     const inputHasAudio = await hasAudioStream(segmentPaths[i]);
@@ -540,7 +668,6 @@ async function renderWithXfade(taskId, segmentPaths, segDurations, segments, out
     const args = ['-i', segmentPaths[i]];
 
     if (!inputHasAudio) {
-      // Add silent audio as second input
       args.push('-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo');
     }
 
@@ -711,6 +838,7 @@ app.post('/render', requireAuth, async (req, res) => {
     const {
       projectId,
       segments,
+      textOverlays,
       voiceoverUrl,
       musicUrl,
       musicVolume,
@@ -741,6 +869,7 @@ app.post('/render', requireAuth, async (req, res) => {
     // Start processing in background (don't await)
     processJob(taskId, {
       segments,
+      textOverlays: textOverlays || [],
       voiceoverUrl,
       musicUrl,
       musicVolume,
