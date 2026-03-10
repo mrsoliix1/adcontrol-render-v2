@@ -116,17 +116,28 @@ async function imageToVideo(taskId, imagePath, outputPath, duration, outW, outH,
   const args = [
     '-loop', '1',
     '-i', imagePath,
+    '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo',
     '-t', String(duration),
     '-vf', `scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,fps=${fps},format=yuv420p`,
     '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-threads', '2',
-    // Add silent audio track so xfade audio crossfade works
-    '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo',
     '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
+    '-map', '0:v', '-map', '1:a',
     '-shortest',
     '-y', outputPath,
   ];
   await runFfmpeg(taskId, args);
   return outputPath;
+}
+
+// Check if a file has an audio stream
+function hasAudioStream(filePath) {
+  return new Promise((resolve) => {
+    ffmpeg.ffprobe(filePath, (err, metadata) => {
+      if (err) return resolve(false);
+      const hasAudio = metadata.streams.some(s => s.codec_type === 'audio');
+      resolve(hasAudio);
+    });
+  });
 }
 
 function getVideoDuration(filePath) {
@@ -422,15 +433,28 @@ async function renderWithConcat(taskId, segmentPaths, segments, outputPath, outW
     let af = `volume=${segVol}`;
     if (speed !== 1.0) af = `atempo=${speed},${af}`;
 
-    const args = [
-      '-i', segmentPaths[i],
+    // Check if input has audio — if not, add silent audio source
+    const inputHasAudio = await hasAudioStream(segmentPaths[i]);
+
+    const args = ['-i', segmentPaths[i]];
+
+    if (!inputHasAudio) {
+      args.push('-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo');
+    }
+
+    args.push(
       '-vf', vf,
       '-af', af,
       '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-threads', '2',
       '-c:a', 'aac', '-b:a', '128k',
       '-ar', '48000', '-ac', '2',
-      '-y', normPath,
-    ];
+    );
+
+    if (!inputHasAudio) {
+      args.push('-map', '0:v', '-map', '1:a', '-shortest');
+    }
+
+    args.push('-y', normPath);
 
     log(taskId, 'render', `Normalizing segment ${i}`);
     await runFfmpeg(taskId, args);
@@ -509,15 +533,30 @@ async function renderWithXfade(taskId, segmentPaths, segDurations, segments, out
     let af = `volume=${segVol}`;
     if (speed !== 1.0) af = `atempo=${speed},${af}`;
 
-    const args = [
-      '-i', segmentPaths[i],
+    // Check if input has audio — if not, add silent audio source
+    const inputHasAudio = await hasAudioStream(segmentPaths[i]);
+    log(taskId, 'render', `Segment ${i} has audio: ${inputHasAudio}`);
+
+    const args = ['-i', segmentPaths[i]];
+
+    if (!inputHasAudio) {
+      // Add silent audio as second input
+      args.push('-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo');
+    }
+
+    args.push(
       '-vf', vf,
       '-af', af,
       '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-threads', '2',
       '-c:a', 'aac', '-b:a', '128k',
       '-ar', '48000', '-ac', '2',
-      '-y', normPath,
-    ];
+    );
+
+    if (!inputHasAudio) {
+      args.push('-map', '0:v', '-map', '1:a', '-shortest');
+    }
+
+    args.push('-y', normPath);
 
     log(taskId, 'render', `Normalizing segment ${i} for xfade`);
     await runFfmpeg(taskId, args);
@@ -687,8 +726,8 @@ app.post('/render', requireAuth, async (req, res) => {
     }
 
     for (let i = 0; i < segments.length; i++) {
-      if (!segments[i].videoUrl) {
-        return res.status(400).json({ error: `segment[${i}] is missing videoUrl` });
+      if (!segments[i].videoUrl && !segments[i].imageUrl) {
+        return res.status(400).json({ error: `segment[${i}] is missing videoUrl or imageUrl` });
       }
     }
 
