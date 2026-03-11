@@ -241,60 +241,223 @@ function buildAudioMixFilter(videoInputIdx, segVol, speed, voiceoverPath, musicP
   };
 }
 
+// ─── Filter Preset Map (matches FILTER_PRESETS in types.ts) ──────────────────
+
+const FILTER_PRESET_MAP = {
+  'none': '',
+  'vivid': 'eq=saturation=1.4:contrast=1.1',
+  'warm': 'eq=saturation=1.2:brightness=0.05,colorbalance=rs=0.1:gs=0.05:bs=-0.1',
+  'cool': 'hue=h=15,eq=saturation=0.9',
+  'bw': 'hue=s=0',
+  'vintage': 'eq=saturation=0.6:contrast=0.9:brightness=0.1,colorbalance=rs=0.15:gs=0.05:bs=-0.1',
+  'cinematic': 'eq=contrast=1.2:saturation=0.85:brightness=-0.05',
+  'moody': 'eq=contrast=1.3:brightness=-0.15:saturation=0.7',
+  'bright': 'eq=brightness=0.2:saturation=1.1',
+  'faded': 'eq=contrast=0.85:brightness=0.1:saturation=0.6',
+  'dramatic': 'eq=contrast=1.4:brightness=-0.1',
+  'pastel': 'eq=brightness=0.15:saturation=0.5',
+  'muted': 'eq=saturation=0.4:contrast=0.95',
+};
+
 // ─── Visual Filter Builder ───────────────────────────────────────────────────
 
+function needsOverlayCompositing(seg) {
+  return (seg.positionX || 0) !== 0 ||
+         (seg.positionY || 0) !== 0 ||
+         (seg.scale ?? 1) !== 1 ||
+         (seg.rotation || 0) !== 0 ||
+         (seg.opacity ?? 1) < 1;
+}
+
 function buildSegmentVisualFilters(seg, outW, outH, fps) {
-  // Build the video filter chain for a segment including crop, color, blur, fade
   const filters = [];
 
-  // Crop (applied first, before scaling)
+  // 1. Crop
   const cT = seg.cropTop || 0, cB = seg.cropBottom || 0;
   const cL = seg.cropLeft || 0, cR = seg.cropRight || 0;
   if (cT > 0 || cB > 0 || cL > 0 || cR > 0) {
-    // cropTop/Bottom/Left/Right are percentages 0-100
     filters.push(`crop=iw*(${(100 - cL - cR) / 100}):ih*(${(100 - cT - cB) / 100}):iw*(${cL / 100}):ih*(${cT / 100})`);
   }
 
-  // Speed
+  // 2. Speed
   const speed = seg.speed ?? 1.0;
   if (speed !== 1.0) {
     filters.push(`setpts=${(1 / speed).toFixed(4)}*PTS`);
   }
 
-  // Scale and pad to output resolution
-  filters.push(`scale=${outW}:${outH}:force_original_aspect_ratio=decrease`);
-  filters.push(`pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2`);
+  // 3. Scale based on fitMode
+  const fitMode = seg.fitMode || 'fit';
+  switch (fitMode) {
+    case 'fill':
+    case 'crop':
+      filters.push(`scale=${outW}:${outH}:force_original_aspect_ratio=increase`);
+      filters.push(`crop=${outW}:${outH}`);
+      break;
+    case 'stretch':
+      filters.push(`scale=${outW}:${outH}`);
+      break;
+    default: // fit
+      filters.push(`scale=${outW}:${outH}:force_original_aspect_ratio=decrease`);
+      filters.push(`pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2`);
+  }
+
   filters.push(`fps=${fps}`);
   filters.push('format=yuv420p');
 
-  // Color adjustments via eq filter
-  const brightness = (seg.brightness || 0) / 100; // -1 to 1
-  const contrast = 1 + (seg.contrast || 0) / 100; // 0 to 2
-  const saturation = 1 + (seg.saturation || 0) / 100; // 0 to 2
+  // 4. Filter preset
+  const presetFilter = FILTER_PRESET_MAP[seg.filter || 'none'] || '';
+  if (presetFilter) filters.push(presetFilter);
+
+  // 5. Color adjustments (stacks on top of preset)
+  const brightness = (seg.brightness || 0) / 100;
+  const contrast = 1 + (seg.contrast || 0) / 100;
+  const saturation = 1 + (seg.saturation || 0) / 100;
   if (brightness !== 0 || contrast !== 1 || saturation !== 1) {
     filters.push(`eq=brightness=${brightness.toFixed(3)}:contrast=${contrast.toFixed(3)}:saturation=${saturation.toFixed(3)}`);
   }
 
-  // Blur
+  // 6. Blur
   const blur = seg.blur || 0;
   if (blur > 0) {
-    const blurVal = Math.min(blur, 20);
-    filters.push(`boxblur=${blurVal}:${blurVal}`);
+    filters.push(`boxblur=${Math.min(blur, 20)}:${Math.min(blur, 20)}`);
   }
 
-  // Fade in/out
+  // 7. Fade in/out
   const fadeIn = seg.fadeInDuration || 0;
   const fadeOut = seg.fadeOutDuration || 0;
   const duration = seg.duration || 5;
-  if (fadeIn > 0) {
-    filters.push(`fade=t=in:st=0:d=${fadeIn}`);
-  }
+  if (fadeIn > 0) filters.push(`fade=t=in:st=0:d=${fadeIn}`);
   if (fadeOut > 0) {
-    const fadeOutStart = Math.max(0, duration - fadeOut);
-    filters.push(`fade=t=out:st=${fadeOutStart.toFixed(3)}:d=${fadeOut}`);
+    filters.push(`fade=t=out:st=${Math.max(0, duration - fadeOut).toFixed(3)}:d=${fadeOut}`);
   }
 
   return filters.join(',');
+}
+
+// Build overlay-based filter_complex for position/scale/rotation/opacity
+function buildOverlayFilter(seg, outW, outH, fps, audioIdx, af) {
+  const parts = [];
+  let label = '[0:v]';
+  let step = 0;
+
+  // 1. Crop
+  const cT = seg.cropTop || 0, cB = seg.cropBottom || 0;
+  const cL = seg.cropLeft || 0, cR = seg.cropRight || 0;
+  if (cT > 0 || cB > 0 || cL > 0 || cR > 0) {
+    const next = `[c${step}]`;
+    parts.push(`${label}crop=iw*(${(100-cL-cR)/100}):ih*(${(100-cT-cB)/100}):iw*(${cL/100}):ih*(${cT/100})${next}`);
+    label = next;
+    step++;
+  }
+
+  // 2. Speed
+  const speed = seg.speed ?? 1.0;
+  if (speed !== 1.0) {
+    const next = `[c${step}]`;
+    parts.push(`${label}setpts=${(1/speed).toFixed(4)}*PTS${next}`);
+    label = next;
+    step++;
+  }
+
+  // 3. Scale based on fitMode (to intermediate size, not padded yet)
+  const fitMode = seg.fitMode || 'fit';
+  const scale = seg.scale ?? 1;
+  let scaleChain;
+  switch (fitMode) {
+    case 'fill':
+    case 'crop':
+      scaleChain = `scale=${outW}:${outH}:force_original_aspect_ratio=increase,crop=${outW}:${outH}`;
+      break;
+    case 'stretch':
+      scaleChain = `scale=${outW}:${outH}`;
+      break;
+    default:
+      scaleChain = `scale=${outW}:${outH}:force_original_aspect_ratio=decrease`;
+  }
+
+  // Apply scale factor
+  if (scale !== 1) {
+    scaleChain += `,scale=trunc(iw*${scale.toFixed(3)}/2)*2:trunc(ih*${scale.toFixed(3)}/2)*2`;
+  }
+
+  // 4. Filter preset + color adjustments + blur
+  let colorChain = '';
+  const presetFilter = FILTER_PRESET_MAP[seg.filter || 'none'] || '';
+  if (presetFilter) colorChain += presetFilter;
+
+  const brightness = (seg.brightness || 0) / 100;
+  const contrast = 1 + (seg.contrast || 0) / 100;
+  const saturation = 1 + (seg.saturation || 0) / 100;
+  if (brightness !== 0 || contrast !== 1 || saturation !== 1) {
+    if (colorChain) colorChain += ',';
+    colorChain += `eq=brightness=${brightness.toFixed(3)}:contrast=${contrast.toFixed(3)}:saturation=${saturation.toFixed(3)}`;
+  }
+
+  const blur = seg.blur || 0;
+  if (blur > 0) {
+    if (colorChain) colorChain += ',';
+    colorChain += `boxblur=${Math.min(blur,20)}:${Math.min(blur,20)}`;
+  }
+
+  // 5. Rotation
+  const rotation = seg.rotation || 0;
+  let rotateChain = '';
+  if (rotation !== 0) {
+    const rad = (rotation * Math.PI / 180).toFixed(4);
+    rotateChain = `,rotate=${rad}:c=black@0:ow=rotw(${rad}):oh=roth(${rad})`;
+  }
+
+  // 6. Opacity
+  const opacity = seg.opacity ?? 1;
+  let opacityChain = '';
+  if (opacity < 1) {
+    opacityChain = `,format=rgba,colorchannelmixer=aa=${opacity.toFixed(3)}`;
+  }
+
+  // Combine into foreground chain
+  let fgChain = scaleChain;
+  if (colorChain) fgChain += ',' + colorChain;
+  if (rotateChain) fgChain += rotateChain;
+  if (opacityChain) fgChain += opacityChain;
+
+  const next = `[fg]`;
+  parts.push(`${label}${fgChain}${next}`);
+
+  // 7. Background canvas
+  parts.push(`color=black:s=${outW}x${outH}:r=${fps}[bg]`);
+
+  // 8. Overlay with position offset
+  const posX = seg.positionX || 0;
+  const posY = seg.positionY || 0;
+  const offsetX = Math.round((posX / 100) * outW);
+  const offsetY = Math.round((posY / 100) * outH);
+  const overlayX = `(W-w)/2+${offsetX}`;
+  const overlayY = `(H-h)/2+${offsetY}`;
+
+  parts.push(`[bg][fg]overlay=${overlayX}:${overlayY}:shortest=1,fps=${fps},format=yuv420p[prefade]`);
+
+  // 9. Fade in/out
+  const fadeIn = seg.fadeInDuration || 0;
+  const fadeOut = seg.fadeOutDuration || 0;
+  const duration = seg.duration || 5;
+  let fadeChain = '';
+  if (fadeIn > 0) fadeChain += `fade=t=in:st=0:d=${fadeIn}`;
+  if (fadeOut > 0) {
+    if (fadeChain) fadeChain += ',';
+    fadeChain += `fade=t=out:st=${Math.max(0, duration - fadeOut).toFixed(3)}:d=${fadeOut}`;
+  }
+
+  if (fadeChain) {
+    parts.push(`[prefade]${fadeChain}[vout]`);
+  } else {
+    // Rename [prefade] to [vout]
+    parts[parts.length - 1] = parts[parts.length - 1].replace('[prefade]', '[vout]');
+  }
+
+  // 10. Audio
+  parts.push(`[${audioIdx}:a]${af}[aout]`);
+
+  return parts.join(';');
 }
 
 function buildSegmentAudioFilters(seg) {
@@ -304,6 +467,42 @@ function buildSegmentAudioFilters(seg) {
   if (speed !== 1.0) parts.push(`atempo=${speed}`);
   parts.push(`volume=${volume}`);
   return parts.join(',');
+}
+
+// ─── Unified Segment Normalizer ──────────────────────────────────────────────
+
+async function normalizeOneSegment(taskId, inputPath, outputPath, seg, outW, outH, fps) {
+  const af = buildSegmentAudioFilters(seg);
+  const inputHasAudio = await hasAudioStream(inputPath);
+  log(taskId, 'render', `Normalizing segment (audio: ${inputHasAudio}, overlay: ${needsOverlayCompositing(seg)})`);
+
+  const args = ['-i', inputPath];
+  let audioIdx = 0;
+
+  if (!inputHasAudio) {
+    args.push('-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo');
+    audioIdx = 1;
+  }
+
+  let filterComplex;
+  if (needsOverlayCompositing(seg)) {
+    filterComplex = buildOverlayFilter(seg, outW, outH, fps, audioIdx, af);
+  } else {
+    const vf = buildSegmentVisualFilters(seg, outW, outH, fps);
+    filterComplex = `[0:v]${vf}[vout];[${audioIdx}:a]${af}[aout]`;
+  }
+
+  args.push('-filter_complex', filterComplex);
+  args.push('-map', '[vout]', '-map', '[aout]');
+  if (!inputHasAudio) args.push('-shortest');
+
+  args.push(
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-threads', '2',
+    '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
+    '-y', outputPath,
+  );
+
+  await runFfmpeg(taskId, args);
 }
 
 // ─── Text Overlay Post-Processing ────────────────────────────────────────────
@@ -321,16 +520,42 @@ async function applyTextOverlays(taskId, inputPath, outputPath, textOverlays, ou
 
     // Position
     let x = '(w-text_w)/2';
-    let y = 'h*0.85-text_h/2';
-    if (t.textPosition === 'top') y = 'h*0.15-text_h/2';
-    else if (t.textPosition === 'center') y = '(h-text_h)/2';
+    let yBase = 'h*0.85-text_h/2';
+    if (t.textPosition === 'top') yBase = 'h*0.15-text_h/2';
+    else if (t.textPosition === 'center') yBase = '(h-text_h)/2';
 
     const startTime = t.startTime || 0;
     const endTime = startTime + (t.duration || 5);
+    const animDur = 0.5;
+
+    // Text animation expressions
+    let alphaExpr = '1';
+    let yExpr = yBase;
+    const anim = t.textAnimation || 'none';
+    const tVar = `(t-${startTime.toFixed(3)})`;
+
+    switch (anim) {
+      case 'fade-in':
+        alphaExpr = `if(lt(${tVar},${animDur}),${tVar}/${animDur},1)`;
+        break;
+      case 'slide-up':
+        alphaExpr = `if(lt(${tVar},${animDur}),${tVar}/${animDur},1)`;
+        yExpr = `${yBase}+if(lt(${tVar},${animDur}),80*(1-${tVar}/${animDur}),0)`;
+        break;
+      case 'slide-down':
+        alphaExpr = `if(lt(${tVar},${animDur}),${tVar}/${animDur},1)`;
+        yExpr = `${yBase}-if(lt(${tVar},${animDur}),80*(1-${tVar}/${animDur}),0)`;
+        break;
+      case 'bounce':
+        yExpr = `${yBase}+if(lt(${tVar},0.6),sin(${tVar}/0.6*PI*3)*20*(1-${tVar}/0.6),0)`;
+        break;
+      default:
+        break;
+    }
 
     let filter = `drawtext=text='${text}':fontsize=${fontSize}:fontcolor=${fontColor}:fontfamily='${fontFamily}'`;
-    filter += `:x=${x}:y=${y}`;
-    filter += `:enable='between(t,${startTime.toFixed(3)},${endTime.toFixed(3)})'`;
+    filter += `:x=${x}:y=${yExpr}`;
+    filter += `:alpha='if(between(t,${startTime.toFixed(3)},${endTime.toFixed(3)}),${alphaExpr},0)'`;
 
     // Bold
     if (t.fontWeight === 'bold' || t.fontWeight === '700') {
@@ -354,7 +579,6 @@ async function applyTextOverlays(taskId, inputPath, outputPath, textOverlays, ou
 
   const vf = drawtextFilters.join(',');
 
-  // Re-encode video with text, copy audio as-is
   const args = [
     '-i', inputPath,
     '-vf', vf,
@@ -458,7 +682,7 @@ async function processJob(taskId, params) {
       await renderSingleSegment(
         taskId, segmentPaths[0], outputPath, sortedSegments[0],
         outW, outH, fps, outputFormat, voiceoverPath, musicPath,
-        musicVolume, voiceoverVolume
+        musicVolume, voiceoverVolume, workDir
       );
     } else if (hasTransitions) {
       log(taskId, 'render', `Rendering ${segmentPaths.length} segments with xfade transitions`);
@@ -516,85 +740,41 @@ async function processJob(taskId, params) {
 
 // ─── Render Strategies ────────────────────────────────────────────────────────
 
-async function renderSingleSegment(taskId, inputPath, outputPath, segment, outW, outH, fps, outputFormat, voiceoverPath, musicPath, musicVolume, voiceoverVolume) {
-  const segVol = segment.volume ?? 1.0;
-  const speed = segment.speed ?? 1.0;
+async function renderSingleSegment(taskId, inputPath, outputPath, segment, outW, outH, fps, outputFormat, voiceoverPath, musicPath, musicVolume, voiceoverVolume, workDir) {
+  // If we have voiceover/music, normalize first then mix audio separately
+  if (voiceoverPath || musicPath) {
+    const normPath = join(workDir || '/tmp', `single_norm.mp4`);
+    await normalizeOneSegment(taskId, inputPath, normPath, segment, outW, outH, fps);
 
-  const vf = buildSegmentVisualFilters(segment, outW, outH, fps);
-  const af = buildSegmentAudioFilters(segment);
+    const segVol = segment.volume ?? 1.0;
+    const speed = segment.speed ?? 1.0;
+    const audioFilter = buildAudioMixFilter(0, segVol, speed, voiceoverPath, musicPath, musicVolume, voiceoverVolume);
 
-  const args = ['-i', inputPath];
+    const args = ['-i', normPath];
+    if (voiceoverPath) args.push('-i', voiceoverPath);
+    if (musicPath) args.push('-i', musicPath);
 
-  // Check if input has audio
-  const inputHasAudio = await hasAudioStream(inputPath);
-  if (!inputHasAudio) {
-    args.push('-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo');
-  }
+    if (audioFilter) {
+      args.push('-filter_complex', audioFilter.filter);
+      args.push('-map', '0:v', '-map', `[${audioFilter.outputLabel}]`);
+    }
 
-  if (voiceoverPath) args.push('-i', voiceoverPath);
-  if (musicPath) args.push('-i', musicPath);
-
-  const mainAudioIdx = inputHasAudio ? 0 : 1;
-  const audioFilter = buildAudioMixFilter(mainAudioIdx, segVol, speed, voiceoverPath, musicPath, musicVolume, voiceoverVolume);
-
-  if (audioFilter) {
-    const fullFilter = `[0:v]${vf}[vout];${audioFilter.filter}`;
-    args.push('-filter_complex', fullFilter);
-    args.push('-map', '[vout]');
-    args.push('-map', `[${audioFilter.outputLabel}]`);
-  } else if (!inputHasAudio) {
-    // Use filter_complex to properly route video + silent audio
-    args.push('-filter_complex', `[0:v]${vf}[vout];[1:a]${af}[aout]`);
-    args.push('-map', '[vout]', '-map', '[aout]');
-    args.push('-shortest');
+    const codecArgs = buildVideoCodecArgs(outputFormat);
+    args.push(...codecArgs, '-movflags', '+faststart', '-shortest', '-y', outputPath);
+    await runFfmpeg(taskId, args);
   } else {
-    args.push('-vf', vf);
-    args.push('-af', af);
+    // Simple case — just normalize directly to output
+    await normalizeOneSegment(taskId, inputPath, outputPath, segment, outW, outH, fps);
   }
-
-  const codecArgs = buildVideoCodecArgs(outputFormat);
-  args.push(...codecArgs);
-  args.push('-movflags', '+faststart');
-  args.push('-shortest');
-  args.push('-y', outputPath);
-
-  await runFfmpeg(taskId, args);
 }
 
 async function renderWithConcat(taskId, segmentPaths, segments, outputPath, outW, outH, fps, outputFormat, voiceoverPath, musicPath, musicVolume, voiceoverVolume, workDir) {
-  // Step 1: Normalize all segments to same resolution/fps/codec with full visual filters
+  // Step 1: Normalize all segments
   const normalizedPaths = [];
   for (let i = 0; i < segmentPaths.length; i++) {
-    const seg = segments[i];
     const normPath = join(workDir, `norm_${i}.ts`);
-
-    const vf = buildSegmentVisualFilters(seg, outW, outH, fps);
-    const af = buildSegmentAudioFilters(seg);
-
-    const inputHasAudio = await hasAudioStream(segmentPaths[i]);
-
-    const args = ['-i', segmentPaths[i]];
-
-    if (!inputHasAudio) {
-      args.push('-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo');
-      args.push('-filter_complex', `[0:v]${vf}[vout];[1:a]${af}[aout]`);
-      args.push('-map', '[vout]', '-map', '[aout]');
-      args.push('-shortest');
-    } else {
-      args.push('-vf', vf);
-      args.push('-af', af);
-    }
-
-    args.push(
-      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-threads', '2',
-      '-c:a', 'aac', '-b:a', '128k',
-      '-ar', '48000', '-ac', '2',
-    );
-
-    args.push('-y', normPath);
-
     log(taskId, 'render', `Normalizing segment ${i}`);
-    await runFfmpeg(taskId, args);
+    await normalizeOneSegment(taskId, segmentPaths[i], normPath, segments[i], outW, outH, fps);
     normalizedPaths.push(normPath);
 
     const pct = 30 + Math.round((i + 1) / segmentPaths.length * 20);
@@ -653,42 +833,13 @@ async function renderWithConcat(taskId, segmentPaths, segments, outputPath, outW
 }
 
 async function renderWithXfade(taskId, segmentPaths, segDurations, segments, outputPath, outW, outH, fps, outputFormat, voiceoverPath, musicPath, musicVolume, voiceoverVolume, workDir) {
-  // Step 1: Normalize all segments to same resolution/fps/codec with full visual filters
+  // Step 1: Normalize all segments
   const normalizedPaths = [];
   const normalizedDurations = [];
   for (let i = 0; i < segmentPaths.length; i++) {
-    const seg = segments[i];
     const normPath = join(workDir, `xnorm_${i}.mp4`);
-
-    const vf = buildSegmentVisualFilters(seg, outW, outH, fps);
-    const af = buildSegmentAudioFilters(seg);
-
-    const inputHasAudio = await hasAudioStream(segmentPaths[i]);
-    log(taskId, 'render', `Segment ${i} has audio: ${inputHasAudio}`);
-
-    const args = ['-i', segmentPaths[i]];
-
-    if (!inputHasAudio) {
-      // Use filter_complex to properly route video + silent audio
-      args.push('-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo');
-      args.push('-filter_complex', `[0:v]${vf}[vout];[1:a]${af}[aout]`);
-      args.push('-map', '[vout]', '-map', '[aout]');
-      args.push('-shortest');
-    } else {
-      args.push('-vf', vf);
-      args.push('-af', af);
-    }
-
-    args.push(
-      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-threads', '2',
-      '-c:a', 'aac', '-b:a', '128k',
-      '-ar', '48000', '-ac', '2',
-    );
-
-    args.push('-y', normPath);
-
     log(taskId, 'render', `Normalizing segment ${i} for xfade`);
-    await runFfmpeg(taskId, args);
+    await normalizeOneSegment(taskId, segmentPaths[i], normPath, segments[i], outW, outH, fps);
     normalizedPaths.push(normPath);
 
     const actualDur = await getVideoDuration(normPath);
@@ -698,8 +849,7 @@ async function renderWithXfade(taskId, segmentPaths, segDurations, segments, out
     updateJob(taskId, { progress: pct });
   }
 
-  // Step 2: Build xfade filter chain
-  const transitionDuration = 0.5;
+  // Step 2: Build xfade filter chain with per-segment transition durations
   const inputs = normalizedPaths.map(p => ['-i', p]).flat();
 
   let videoFilter = '';
@@ -712,13 +862,14 @@ async function renderWithXfade(taskId, segmentPaths, segDurations, segments, out
     const seg = segments[i];
     const transType = seg.transition || 'fade';
     const xfadeName = XFADE_MAP[transType] || 'fade';
-    const offset = Math.max(0, cumulativeOffset - transitionDuration);
+    const tDuration = Math.min(seg.transitionDuration || 0.5, normalizedDurations[i] * 0.8, cumulativeOffset * 0.8);
+    const offset = Math.max(0, cumulativeOffset - tDuration);
     const isLast = i === normalizedPaths.length - 1;
     const vOutLabel = isLast ? '[vout]' : `[v${i}]`;
     const aOutLabel = isLast ? '[aout_raw]' : `[a${i}]`;
 
-    videoFilter += `${prevVideoLabel}[${i}:v]xfade=transition=${xfadeName}:duration=${transitionDuration}:offset=${offset.toFixed(3)}${vOutLabel};`;
-    audioFilter += `${prevAudioLabel}[${i}:a]acrossfade=d=${transitionDuration}:c1=tri:c2=tri${aOutLabel};`;
+    videoFilter += `${prevVideoLabel}[${i}:v]xfade=transition=${xfadeName}:duration=${tDuration.toFixed(3)}:offset=${offset.toFixed(3)}${vOutLabel};`;
+    audioFilter += `${prevAudioLabel}[${i}:a]acrossfade=d=${tDuration.toFixed(3)}:c1=tri:c2=tri${aOutLabel};`;
 
     prevVideoLabel = vOutLabel;
     prevAudioLabel = aOutLabel;
