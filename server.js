@@ -542,12 +542,14 @@ async function renderSingleSegment(taskId, inputPath, outputPath, segment, outW,
     args.push('-filter_complex', fullFilter);
     args.push('-map', '[vout]');
     args.push('-map', `[${audioFilter.outputLabel}]`);
+  } else if (!inputHasAudio) {
+    // Use filter_complex to properly route video + silent audio
+    args.push('-filter_complex', `[0:v]${vf}[vout];[1:a]${af}[aout]`);
+    args.push('-map', '[vout]', '-map', '[aout]');
+    args.push('-shortest');
   } else {
     args.push('-vf', vf);
     args.push('-af', af);
-    if (!inputHasAudio) {
-      args.push('-map', '0:v', '-map', '1:a', '-shortest');
-    }
   }
 
   const codecArgs = buildVideoCodecArgs(outputFormat);
@@ -575,19 +577,19 @@ async function renderWithConcat(taskId, segmentPaths, segments, outputPath, outW
 
     if (!inputHasAudio) {
       args.push('-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo');
+      args.push('-filter_complex', `[0:v]${vf}[vout];[1:a]${af}[aout]`);
+      args.push('-map', '[vout]', '-map', '[aout]');
+      args.push('-shortest');
+    } else {
+      args.push('-vf', vf);
+      args.push('-af', af);
     }
 
     args.push(
-      '-vf', vf,
-      '-af', af,
       '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-threads', '2',
       '-c:a', 'aac', '-b:a', '128k',
       '-ar', '48000', '-ac', '2',
     );
-
-    if (!inputHasAudio) {
-      args.push('-map', '0:v', '-map', '1:a', '-shortest');
-    }
 
     args.push('-y', normPath);
 
@@ -661,27 +663,27 @@ async function renderWithXfade(taskId, segmentPaths, segDurations, segments, out
     const vf = buildSegmentVisualFilters(seg, outW, outH, fps);
     const af = buildSegmentAudioFilters(seg);
 
-    // Check if input has audio — if not, add silent audio source
     const inputHasAudio = await hasAudioStream(segmentPaths[i]);
     log(taskId, 'render', `Segment ${i} has audio: ${inputHasAudio}`);
 
     const args = ['-i', segmentPaths[i]];
 
     if (!inputHasAudio) {
+      // Use filter_complex to properly route video + silent audio
       args.push('-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo');
+      args.push('-filter_complex', `[0:v]${vf}[vout];[1:a]${af}[aout]`);
+      args.push('-map', '[vout]', '-map', '[aout]');
+      args.push('-shortest');
+    } else {
+      args.push('-vf', vf);
+      args.push('-af', af);
     }
 
     args.push(
-      '-vf', vf,
-      '-af', af,
       '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-threads', '2',
       '-c:a', 'aac', '-b:a', '128k',
       '-ar', '48000', '-ac', '2',
     );
-
-    if (!inputHasAudio) {
-      args.push('-map', '0:v', '-map', '1:a', '-shortest');
-    }
 
     args.push('-y', normPath);
 
